@@ -8,7 +8,7 @@ const ANIME_LOOP_TIME = 10 * 8 * 1000; // 80 ثانية (نفس قيمة الس�
 const INITIAL_REFRESH_TOKEN = process.env.REFRESH_TOKEN || 'c0626a4739b86c2bf9524cb3bbd25d20a1ddae2b';
 
 // يمكن ترك access token فارغًا؛ إذا كان فارغًا سيحاول السكربت الحصول عليه من refresh token.
-const INITIAL_ACCESS_TOKEN = process.env.ACCESS_TOKEN || '4b498c91de2a9604a35cefb7f6f1eae3d90f5a9d';
+const INITIAL_ACCESS_TOKEN = process.env.ACCESS_TOKEN || 'eb521e2ebaa30ccad1682d3e3310246d3eace801';
 
 // ملف محلي لحفظ آخر access/refresh token تلقائيًا.
 const TOKEN_STORE_FILE = require('path').join(__dirname, 'token_store.json');
