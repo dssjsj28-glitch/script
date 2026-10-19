@@ -4,14 +4,16 @@
 const ANIME_ID = 2025;
 const ANIME_LOOP_TIME = 10 * 8 * 1000; // 80 ثانية (نفس قيمة السكربت الأصلي)
 
-// ضع refresh_token هنا، أو الأفضل استخدم متغير البيئة REFRESH_TOKEN.
-const INITIAL_REFRESH_TOKEN = process.env.REFRESH_TOKEN || 'c0626a4739b86c2bf9524cb3bbd25d20a1ddae2b';
+// التوكنات الحالية؛ سيحدّث السكربت هاتين القيمتين داخل هذا الملف بعد نجاح التجديد.
+const DEFAULT_REFRESH_TOKEN = 'b22d097f0091fb85665f299b096e225310a4b8f4';
+const DEFAULT_ACCESS_TOKEN = '44bdb47d9bde0d2379542acd0071a74637b59ead';
 
-// يمكن ترك access token فارغًا؛ إذا كان فارغًا سيحاول السكربت الحصول عليه من refresh token.
-const INITIAL_ACCESS_TOKEN = process.env.ACCESS_TOKEN || '9cdce29e5cd5bab56b94defa236a5c60048dc583';
-
-// ملف محلي لحفظ آخر access/refresh token تلقائيًا.
-const TOKEN_STORE_FILE = require('path').join(__dirname, 'token_store.json');
+// أخطاء API العادية لا تجدد التوكن. التجديد الدوري كل 24 ساعة، وفشل التجديد نفسه يعيد المحاولة بعد 5 دقائق.
+const TOKEN_REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
+const TOKEN_REFRESH_RETRY_INTERVAL = 5 * 60 * 1000;
+// يحدّث السكربت هذين الوقتين داخل الكود للحفاظ على الجدول بعد إعادة التشغيل.
+const LAST_REFRESH_ATTEMPT_AT = 0;
+const NEXT_REFRESH_RETRY_AT = 0;
 
 const axios = require('axios');
 const express = require('express');
@@ -29,63 +31,54 @@ const CLIENT_ID = 'android-app2';
 const CLIENT_SECRET = '7befba6263cc14c90d2f1d6da2c5cf9b251bfbbd';
 
 // ==========================================
-// 🔐 إدارة access/refresh token
+// 🔐 إدارة التوكن — التجديد المجدول فقط
 // ==========================================
-let accessToken = INITIAL_ACCESS_TOKEN.trim();
-let refreshToken = INITIAL_REFRESH_TOKEN.trim();
+let accessToken = DEFAULT_ACCESS_TOKEN.trim();
+let refreshToken = DEFAULT_REFRESH_TOKEN.trim();
 let refreshPromise = null;
+let lastRefreshAttemptAt = Number(LAST_REFRESH_ATTEMPT_AT) || 0;
+let nextRefreshRetryAt = Number(NEXT_REFRESH_RETRY_AT) || 0;
 
-function loadTokenStore() {
+/**
+ * يحفظ access token وrefresh token ووقت آخر محاولة داخل ثوابت هذا الملف.
+ * ملاحظة: هذا يغيّر ملف السكربت على القرص؛ لا يحدّث مستودع Git تلقائيًا.
+ */
+function saveTokensIntoSource() {
     try {
-        if (!fs.existsSync(TOKEN_STORE_FILE)) return {};
-        const raw = fs.readFileSync(TOKEN_STORE_FILE, 'utf8');
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : {};
+        const sourcePath = __filename;
+        const original = fs.readFileSync(sourcePath, 'utf8');
+        let updated = original
+            .replace(/const DEFAULT_REFRESH_TOKEN = ['"][^'\"]*['"];?/, `const DEFAULT_REFRESH_TOKEN = ${JSON.stringify(refreshToken)};`)
+            .replace(/const DEFAULT_ACCESS_TOKEN = ['"][^'\"]*['"];?/, `const DEFAULT_ACCESS_TOKEN = ${JSON.stringify(accessToken)};`)
+            .replace(/const LAST_REFRESH_ATTEMPT_AT = \d+;/, `const LAST_REFRESH_ATTEMPT_AT = ${Math.trunc(lastRefreshAttemptAt)};`)
+            .replace(/const NEXT_REFRESH_RETRY_AT = \d+;/, `const NEXT_REFRESH_RETRY_AT = ${Math.trunc(nextRefreshRetryAt)};`);
+
+        if (updated === original) {
+            throw new Error('لم يعثر السكربت على ثوابت التوكنات أو وقت التجديد داخل الملف.');
+        }
+
+        const temporaryPath = `${sourcePath}.tmp`;
+        fs.writeFileSync(temporaryPath, updated, { encoding: 'utf8', mode: 0o600 });
+        fs.renameSync(temporaryPath, sourcePath);
+        console.log('💾 تم حفظ التوكنات ووقت آخر محاولة داخل ملف السكربت نفسه.');
+        return true;
     } catch (error) {
-        console.log('⚠️ تعذر قراءة token_store.json، سيُستخدم التوكن الموجود في الإعدادات.');
-        return {};
+        console.log(`⚠️ تعذّر تحديث التوكنات داخل الكود: ${error.message}`);
+        console.log('ℹ️ سيبقى التوكن الحالي في الذاكرة، لكن قد لا يُحفظ بعد إعادة تشغيل الخدمة.');
+        return false;
     }
 }
 
-function saveTokenStore() {
-    try {
-        const tempFile = `${TOKEN_STORE_FILE}.tmp`;
-        const payload = JSON.stringify({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-            updated_at: new Date().toISOString()
-        }, null, 2);
-
-        fs.writeFileSync(tempFile, payload, { encoding: 'utf8', mode: 0o600 });
-        fs.renameSync(tempFile, TOKEN_STORE_FILE);
-        console.log('💾 تم حفظ التوكنات الجديدة في token_store.json');
-    } catch (error) {
-        console.log('⚠️ تعذر حفظ التوكنات الجديدة:', error.message);
-    }
-}
-
-const storedTokens = loadTokenStore();
-// الأولوية: متغيرات البيئة الصريحة، ثم آخر توكن محفوظ، ثم القيم الابتدائية إن وُجدت.
-// لا نعود أبدًا إلى access_token قديم مكتوب داخل السكربت بعد إعادة التشغيل.
-if (!refreshToken && storedTokens.refresh_token) refreshToken = String(storedTokens.refresh_token).trim();
-if (!accessToken && storedTokens.access_token) accessToken = String(storedTokens.access_token).trim();
-if (!refreshToken && INITIAL_REFRESH_TOKEN) refreshToken = INITIAL_REFRESH_TOKEN.trim();
-if (!accessToken && INITIAL_ACCESS_TOKEN) accessToken = INITIAL_ACCESS_TOKEN.trim();
-
-function hasRefreshToken() {
-    return Boolean(refreshToken && !refreshToken.includes('ضع_الريفرش_توكن_هنا'));
-}
-
-async function refreshSession(reason = 'غير معروف') {
-    // منع تنفيذ عدة عمليات refresh في نفس اللحظة.
+async function refreshSession(reason = 'التجديد المجدول كل 24 ساعة') {
+    // منع تنفيذ عمليتي تجديد متزامنتين.
     if (refreshPromise) return refreshPromise;
 
-    if (!hasRefreshToken()) {
-        throw new Error('لم يتم وضع refresh_token صالح. ضع التوكن في INITIAL_REFRESH_TOKEN أو REFRESH_TOKEN.');
+    if (!refreshToken) {
+        throw new Error('لا يوجد refresh token محفوظ داخل الكود.');
     }
 
     refreshPromise = (async () => {
-        console.log(`🔄 جارٍ تجديد الجلسة بسبب: ${reason}`);
+        console.log(`🔄 بدأت محاولة التجديد المجدولة: ${reason}`);
 
         const res = await axios.post(
             REFRESH_URL,
@@ -106,22 +99,17 @@ async function refreshSession(reason = 'غير معروف') {
         const newRefreshToken = body.refresh_token;
 
         if (!newAccessToken) {
-            throw new Error(`الـrefresh endpoint لم يعطِ access_token. الرد: ${JSON.stringify(res.data)}`);
+            throw new Error(`لم يُرجع endpoint قيمة access_token. الرد: ${JSON.stringify(res.data)}`);
         }
 
         accessToken = String(newAccessToken).trim();
+        if (newRefreshToken) refreshToken = String(newRefreshToken).trim();
 
-        // بعض الأنظمة تعطي refresh token جديدًا مع كل عملية refresh.
-        // نستبدله فورًا ونحفظه للاستعمال القادم.
-        if (newRefreshToken) {
-            refreshToken = String(newRefreshToken).trim();
-        }
+        // تحديث القيم داخل مصدر السكربت فور نجاح التجديد.
+        saveTokensIntoSource();
 
-        saveTokenStore();
-
-        console.log(`✅ تم تجديد الجلسة بنجاح. access_token صالح لمدة تقريبية: ${body.expires_in || 'غير محدد'} ثانية.`);
-        if (newRefreshToken) console.log('♻️ تم تدوير refresh_token وحفظ القيمة الجديدة.');
-
+        console.log(`✅ نجح التجديد. مدة الصلاحية المعلنة: ${body.expires_in || 'غير محددة'} ثانية.`);
+        if (newRefreshToken) console.log('♻️ تم حفظ refresh token الجديد داخل الكود.');
         return accessToken;
     })();
 
@@ -130,6 +118,62 @@ async function refreshSession(reason = 'غير معروف') {
     } finally {
         refreshPromise = null;
     }
+}
+
+// التجديد الدوري كل 24 ساعة فقط. لا تستدعي أخطاء API هذه الدالة.
+// إذا فشلت محاولة التجديد نفسها، تُعاد بعد 5 دقائق، وتتكرر كل 5 دقائق حتى تنجح.
+// موعد إعادة المحاولة يُحفظ داخل الكود للمساعدة على استعادته بعد إعادة التشغيل.
+function startScheduledTokenRefresh() {
+    if (!lastRefreshAttemptAt && !nextRefreshRetryAt) {
+        // أول تشغيل: ابدأ حساب الـ24 ساعة من الآن دون تجديد فوري.
+        lastRefreshAttemptAt = Date.now();
+        saveTokensIntoSource();
+    }
+
+    let scheduledTimer = null;
+
+    const scheduleNext = () => {
+        if (scheduledTimer) clearTimeout(scheduledTimer);
+
+        const now = Date.now();
+        const isRetry = nextRefreshRetryAt > 0;
+        const delay = isRetry
+            ? Math.max(0, nextRefreshRetryAt - now)
+            : Math.max(0, TOKEN_REFRESH_INTERVAL - (now - lastRefreshAttemptAt));
+
+        console.log(isRetry
+            ? `⏳ فشلت محاولة التجديد السابقة؛ ستتم إعادة المحاولة بعد نحو ${Math.ceil(delay / 60000)} دقيقة.`
+            : `⏰ التجديد مضبوط على مرة كل 24 ساعة؛ المحاولة التالية بعد نحو ${Math.ceil(delay / 60000)} دقيقة.`);
+
+        scheduledTimer = setTimeout(async () => {
+            // لا نحتفظ بموعد retry قديم بينما المحاولة قيد التنفيذ.
+            nextRefreshRetryAt = 0;
+            lastRefreshAttemptAt = Date.now();
+            saveTokensIntoSource();
+
+            try {
+                await refreshSession(isRetry
+                    ? 'إعادة محاولة التجديد بعد فشل سابق (بعد 5 دقائق)'
+                    : 'موعد التجديد الدوري كل 24 ساعة');
+
+                // نجاح: يبدأ موعد الـ24 ساعة التالية من وقت النجاح.
+                lastRefreshAttemptAt = Date.now();
+                nextRefreshRetryAt = 0;
+                saveTokensIntoSource();
+                console.log('✅ اكتمل التجديد؛ لن تحدث محاولة أخرى قبل موعد الـ24 ساعة التالي ما لم تفشل محاولة التجديد ذاتها.');
+            } catch (error) {
+                // الاستثناء الوحيد: فشل عملية التجديد نفسها يعيد المحاولة بعد 5 دقائق.
+                nextRefreshRetryAt = Date.now() + TOKEN_REFRESH_RETRY_INTERVAL;
+                saveTokensIntoSource();
+                console.log(`❌ فشلت محاولة التجديد: ${error.message}`);
+                console.log('🔁 ستتم إعادة محاولة التجديد بعد 5 دقائق. أخطاء الطلبات العادية لا تُطلق تجديدًا.');
+            }
+
+            scheduleNext();
+        }, delay);
+    };
+
+    scheduleNext();
 }
 
 function isApiErrorPayload(data) {
@@ -161,30 +205,6 @@ function isApiErrorPayload(data) {
     return /unauthorized|forbidden|invalid token|expired token|authentication failed|authorization failed|server error|internal server|bad gateway|service unavailable|request failed|failed to (?:create|add|post|send)|comment.*(?:failed|error)|reply.*(?:failed|error)|خط[أا]|فشل|غير صالح|انتهت الجلسة|الخادم.*(?:خطأ|فشل)|تعذر.*(?:إضافة|إرسال)/.test(text);
 }
 
-// مهم جدًا: ليس كل HTTP error يعني أن التوكن منتهي.
-// مثال: 404 Anime comment not found يجب ألا يستهلك refresh token.
-function isTokenInvalidResponse(status, data) {
-    // هذا يغطي الحالة التي عرضتها: 401 مع Body فارغ.
-    if (status === 401) return true;
-
-    // 403 لا نعتبره مشكلة توكن إلا إذا كان الرد يذكر المصادقة/التوكن صراحة.
-    if (status === 403) {
-        const text = safeJson(data).toLowerCase();
-        return /token|unauthorized|forbidden|auth|credential|جلسة|توكن|مصادقة|صلاحية/.test(text);
-    }
-
-    // أخطاء الخادم الشديدة: نجرب تجديد الجلسة ثم إعادة الطلب مرة واحدة.
-    // هذا لا ينطبق على 404 أو 400 أو 422 وغيرها من أخطاء المعطيات.
-    if (status >= 500 && status <= 599) return true;
-
-    if (data != null) {
-        const text = safeJson(data).toLowerCase();
-        return /invalid token|expired token|token expired|token is invalid|unauthorized|authentication failed|authorization failed|invalid access token|access token.*(?:invalid|expired)|غير صالح.*(?:توكن|رمز)|التوكن.*(?:غير صالح|منتهي)|انتهت.*(?:الجلسة|صلاحية التوكن)|جلسة.*(?:منتهية|غير صالحة)/.test(text);
-    }
-
-    return false;
-}
-
 function responseIndicatesSuccess(data) {
     if (data == null) return false;
     if (isApiErrorPayload(data)) return false;
@@ -210,67 +230,24 @@ function responseIndicatesSuccess(data) {
     }
 
     // بعض نسخ الـAPI ترجع كائنًا غير صريح النجاح بعد 2xx.
-    // لا نعتبره فشلًا هنا؛ الفشل الصريح فقط يستدعي refresh.
+    // لا نعتبره فشلًا هنا؛ يكفي عدم وجود فشل صريح.
     return true;
 }
 
 /**
- * طلب API مع تجديد الجلسة عند فشل الطلب، ثم إعادة المحاولة مرة واحدة فقط.
+ * طلب API عادي بلا تجديد أو إعادة محاولة عند الفشل.
  */
 async function apiRequest(config, label = 'طلب API', options = {}) {
-    if (!accessToken) {
-        await refreshSession('لا يوجد access token عند بداية التشغيل');
-    }
-
-    let didRefresh = false;
-
-    while (true) {
-        let res;
-        try {
-            res = await axios({
-                ...config,
-                timeout: config.timeout || 20000,
-                validateStatus: () => true,
-                headers: {
-                    ...(config.headers || {}),
-                    Authorization: `Bearer ${accessToken}`
-                }
-            });
-        } catch (error) {
-            // أخطاء الشبكة لا تملك status. نجرّب refresh مرة واحدة كما طلبت.
-            if (didRefresh) throw error;
-            didRefresh = true;
-            console.log(`⚠️ فشل ${label} بسبب اتصال/خادم: ${error.message}`);
-            await refreshSession(`${label} — خطأ اتصال/خادم، تجديد الجلسة ثم إعادة المحاولة`);
-            continue;
+    // لا يُجدّد التوكن هنا مهما كان الخطأ؛ التجديد محصور بالجدول كل 24 ساعة.
+    return axios({
+        ...config,
+        timeout: config.timeout || 20000,
+        validateStatus: () => true,
+        headers: {
+            ...(config.headers || {}),
+            Authorization: `Bearer ${accessToken}`
         }
-
-        const status = res.status;
-        const failedHttp = status < 200 || status >= 300;
-        const failedBody = options.checkBody === true && isApiErrorPayload(res.data);
-        const authFailure = isTokenInvalidResponse(status, res.data);
-
-        // نجاح حقيقي.
-        if (!failedHttp && !failedBody) return res;
-
-        // 404 / 400 / 422 وغيرها: الخطأ متعلق بالطلب/المعرّف، وليس بالتوكن.
-        // لا نستهلك refresh token.
-        if (!authFailure) {
-            return res;
-        }
-
-        // فقط عند خطأ توكن/مصادقة أو 5xx: refresh ثم إعادة الطلب مرة واحدة.
-        if (didRefresh) {
-            const err = new Error(`${label} فشل بعد تجديد الجلسة`);
-            err.response = res;
-            throw err;
-        }
-
-        didRefresh = true;
-        console.log(`🔐 ${label}: السيرفر رفض الطلب (HTTP ${status}) — سيتم تجديد التوكن الآن.`);
-        console.log(`🧾 رد السيرفر: ${safeJson(res.data ?? 'لا يوجد Body')}`);
-        await refreshSession(`${label} — status=${status}`);
-    }
+    });
 }
 
 function safeJson(value) {
@@ -282,11 +259,9 @@ function safeJson(value) {
 }
 
 /**
- * إضافة رد تحديدًا.
- * أي فشل صريح من endpoint، حتى لو كان HTTP 200، يؤدي إلى:
- * refresh token -> access token جديد -> retry مرة واحدة.
+ * إضافة رد بمحاولة واحدة فقط؛ لا تجديد ولا إعادة إرسال عند الخطأ.
  */
-async function createReplyWithAutoRefresh(animeCommentId, replyText) {
+async function createReplyOnce(animeCommentId, replyText) {
     const config = {
         method: 'POST',
         url: `${MAIN_BASE_URL}create-anime-comment-reply`,
@@ -296,81 +271,33 @@ async function createReplyWithAutoRefresh(animeCommentId, replyText) {
             spoiler: 'No'
         },
         headers: {
-            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/RP1A.200720.011)',
+            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/SP1A.210812.016)',
             'Content-Type': 'application/json',
             'Client-Id': CLIENT_ID,
             'Client-Secret': CLIENT_SECRET,
-            'X-Requested-With': 'com.anslayer.app'
+            'X-Requested-With': 'com.anslayer.app',
+            Authorization: `Bearer ${accessToken}`
         }
     };
 
-    async function sendOnce() {
-        return axios({
-            ...config,
-            timeout: 20000,
-            validateStatus: () => true,
-            headers: {
-                ...config.headers,
-                Authorization: `Bearer ${accessToken}`
-            }
-        });
-    }
+    // محاولة واحدة فقط: أخطاء الشبكة أو المصادقة لا تؤدي إلى تجديد ولا إلى إعادة إرسال.
+    const response = await axios({
+        ...config,
+        timeout: 20000,
+        validateStatus: () => true
+    });
 
-    let firstResponse;
-    try {
-        firstResponse = await sendOnce();
-    } catch (error) {
-        console.log(`⚠️ خطأ اتصال أثناء إضافة الرد: ${error.message}`);
-        await refreshSession('خطأ اتصال أثناء إضافة الرد — تجديد الجلسة ثم إعادة المحاولة');
-        const retry = await sendOnce();
-        return handleReplyResult(retry, true);
-    }
-
-    const firstSuccess = firstResponse.status >= 200
-        && firstResponse.status < 300
-        && responseIndicatesSuccess(firstResponse.data);
-
-    if (firstSuccess) {
-        return { ok: true, response: firstResponse, refreshed: false };
-    }
-
-    console.log(`⚠️ إضافة الرد لم تنجح بالمحاولة الأولى [HTTP ${firstResponse.status}].`);
-    console.log(`🧾 رد السيرفر: ${safeJson(firstResponse.data ?? 'لا يوجد Body')}`);
-
-    // الحالة المهمة التي عرضتها: 401 + Body فارغ => refresh إجباري.
-    // أما 404 Anime comment not found => لا refresh، لأنه ليس عطل توكن.
-    if (!isTokenInvalidResponse(firstResponse.status, firstResponse.data)) {
-        return { ok: false, response: firstResponse, refreshed: false, expectedFailure: true };
-    }
-
-    console.log(`🔐 السيرفر رفض التوكن (HTTP ${firstResponse.status}).`);
-    console.log('🔄 سيتم استخدام refresh_token المحفوظ لجلب access_token + refresh_token جديدين...');
-
-    await refreshSession(`فشل إضافة الرد بسبب التوكن — HTTP ${firstResponse.status}`);
-
-    const secondResponse = await sendOnce();
-    return handleReplyResult(secondResponse, true);
-}
-
-function handleReplyResult(response, refreshed) {
     const success = response.status >= 200
         && response.status < 300
         && responseIndicatesSuccess(response.data);
 
     if (success) {
-        console.log(`✅ نجحت إضافة الرد${refreshed ? ' بعد تجديد التوكن' : ''}.`);
-        return { ok: true, response, refreshed };
+        console.log('✅ نجح إرسال الرد.');
+        return { ok: true, response, refreshed: false };
     }
 
-    // إذا فشل الطلب مرة ثانية وكان السبب توكن، لا ندخل في loop لا نهائي.
-    if (isTokenInvalidResponse(response.status, response.data)) {
-        const err = new Error(`التوكن ما زال مرفوضًا بعد التجديد. HTTP ${response.status}`);
-        err.response = response;
-        throw err;
-    }
-
-    // 404 comment not found أو أي خطأ متعلق بالبيانات يبقى فشلًا عاديًا بلا refresh إضافي.
-    return { ok: false, response, refreshed, expectedFailure: true };
+    console.log(`⚠️ لم ينجح إرسال الرد [HTTP ${response.status}]؛ لن يتم تجديد التوكن بسبب الخطأ.`);
+    return { ok: false, response, refreshed: false, expectedFailure: true };
 }
 
 // ==========================================
@@ -1437,7 +1364,7 @@ async function testCommentsFlow(animeId) {
                 timeout: 20000,
                 validateStatus: () => true,
                 headers: {
-                    'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/RP1A.200720.011)',
+                    'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 11; Build/SP1A.210812.016)',
                     'Client-Id': CLIENT_ID,
                     'Client-Secret': CLIENT_SECRET,
                     'X-Requested-With': 'com.anslayer.app'
@@ -1475,7 +1402,7 @@ async function testCommentsFlow(animeId) {
     console.log(`\n📬 [أنمي ${animeId}]: جارٍ إرسال رد...`);
 
     try {
-        const replyResult = await createReplyWithAutoRefresh(firstCommentId, replyText);
+        const replyResult = await createReplyOnce(firstCommentId, replyText);
 
         if (replyResult.ok) {
             console.log(`✅ [أنمي ${animeId}] تم نشر: ${replyText.substring(0, 80)}${replyText.length > 80 ? '...' : ''}`);
@@ -1512,18 +1439,14 @@ setInterval(async () => {
 // ==========================================
 (async () => {
     try {
-        if (process.env.TEST_REFRESH_ONLY === '1') {
-            await refreshSession('اختبار يدوي للتجديد');
-            console.log('✅ اختبار التجديد اكتمل وحُفظت آخر قيمة في token_store.json.');
-            process.exit(0);
-        }
         console.log(`📚 تم تحميل ${islamicTexts.length} نصًا محليًا داخل المكتبة.`);
 
-        // إذا لم يوجد access token في الإعدادات أو token_store.json، نطلبه من refresh token.
-        if (!accessToken) {
-            await refreshSession('بداية التشغيل بدون access token');
+        if (!accessToken || !refreshToken) {
+            throw new Error('تأكد من وجود access token وrefresh token في ثوابت أعلى الملف. لن يجري تجديد فوري عند بدء التشغيل.');
         }
 
+        // لا يوجد تجديد عند بدء التشغيل أو بسبب أخطاء API؛ الجدول وحده يجدد كل 24 ساعة.
+        startScheduledTokenRefresh();
         console.log('▶️ بدء تشغيل السكربت للأنمي 2025 فقط...');
 
         // تشغيل فوري، ثم كل 80 ثانية كما في القيمة الأصلية.
